@@ -1,0 +1,378 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+# Parameters to Input while creating stack
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: GitHub Repository Name
+  GitHubUserName:
+    Type: String
+    Description: Github UserName
+  GitHuboAuthToken:
+    Type: String
+    Description: GitHub OAuth Access Token
+    NoEcho: true
+  ECRRepositoryName:
+    Type: String
+    AllowedPattern: (?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*
+
+
+Resources:
+
+# specifies an Amazon Elastic Container Registry (Amazon ECR) repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties: 
+        RepositoryName: !Ref ECRRepositoryName
+
+# creates a CodePipeline pipeline that describes how software changes go through a release process
+  Pipeline:
+      Type: AWS::CodePipeline::Pipeline
+      Properties:
+        ArtifactStore: 
+          Location: !Ref ArtifactsS3Bucket
+          Type: S3
+        RoleArn: !GetAtt CodePipelineServiceRole.Arn
+        Name: !Sub '${AWS::StackName}-test-pipeline'
+        Stages:
+    
+    # Stage for the pulling source code from github repo
+          - Name: SourceCodeStage
+            Actions:
+              - Name: Source
+                ActionTypeId:
+                  Category: Source
+                  Owner: ThirdParty
+                  Provider: GitHub
+                  Version: '1'
+                Configuration:
+                  Repo: !Ref GitHubRepository
+                  Owner: !Ref GitHubUserName
+                  Branch: main
+                  OAuthToken: !Ref GitHuboAuthToken
+                OutputArtifacts:
+                  - Name: Source
+                RunOrder: 1
+     
+    # Stage for the building the artifacts using codebuild
+          - Name: BuildStage
+            Actions:
+              - Name: Build
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref CodeBuildProject
+                InputArtifacts:
+                  - Name: Source
+                OutputArtifacts:
+                  - Name: BuildArtifact
+                RunOrder: 2
+    
+    # Stage for the create the environment using cloudformation
+          - Name: DeployStage
+            Actions:
+            - InputArtifacts:
+              - Name: BuildArtifact
+              - Name: Source
+              Name: CreateEnv
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              OutputArtifacts: []
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn:
+                  Fn::GetAtt:
+                  - CloudFormationTrustRole
+                  - Arn
+                Capabilities: CAPABILITY_IAM
+                StackName:
+                  Fn::Join:
+                  - ''
+                  - - ""
+                    - Ref: AWS::StackName
+                    - "-"
+                    - Ref: AWS::Region
+                    - ""
+                TemplatePath: Source::aws_ecs_fargate_infra.yml
+                ParameterOverrides: |
+                  {
+                    "Repo" : { "Fn::GetParam" : [ "BuildArtifact", "repo.json", "repo" ] }
+                  }
+              RunOrder: 1
+
+   # Stage for the deploying the app using blue/green deployment strategy
+          - Name: DeployingApp-BlueGreen
+            Actions:
+            - InputArtifacts:
+              - Name: BuildArtifact
+              Name: BlueGreen
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: ECS
+              OutputArtifacts: []
+              Configuration:
+                ClusterName: spring-petclinic-ecs-fargate-testing
+                ServiceName: petclinic
+                FileName: imagedetails.json
+
+# creating an S3 bucket to store the artifacts of the build
+  ArtifactsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-artifacts'
+    DeletionPolicy: Delete
+
+# Configuring how CodeBuild builds the source code
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: True
+        EnvironmentVariables: 
+          - Name: REPO
+            Type: PLAINTEXT
+            Value: !Ref ECRRepository
+      LogsConfig:
+        CloudWatchLogs: 
+          GroupName: !Sub '${AWS::StackName}-testing-group'
+          Status: ENABLED
+          StreamName: !Sub '${AWS::StackName}-testing-stream'
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref CodeBuildServiceRole
+
+# Creating IAM Trust role for CloudFormation
+  CloudFormationTrustRole:
+    DependsOn:
+    - ArtifactsS3Bucket
+    Description: Creating service role in IAM for AWS CloudFormation
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - cloudformation.amazonaws.com
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - s3:*
+            Effect: Allow
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "codedeploy:*"
+            Resource: "*"
+          - Action:
+            - iam:CreateRole
+            - iam:AttachRolePolicy
+            - iam:DetachRolePolicy
+            - iam:DeleteRole
+            - iam:DeleteRolePolicy
+            - iam:GetRole
+            - iam:PutRolePolicy
+            - iam:GetRolePolicy
+            - iam:AddRoleToInstanceProfile
+            - iam:RemoveRoleFromInstanceProfile
+            - iam:DeleteInstanceProfile
+            - iam:CreateInstanceProfile
+            - iam:PassRole
+            Effect: Allow
+            Resource: "*"
+          - Action:
+            - cloudformation:CreateChangeSet
+            Effect: Allow
+            Resource:
+            - !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeAccountAttributes
+              - ec2:AttachVolume
+              - ec2:DeleteSubnet
+              - ec2:DescribeInstances
+              - ec2:DeleteTags
+              - ec2:DescribeRegions
+              - ec2:CreateVpc
+              - ec2:AttachInternetGateway
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeInternetGateways
+              - ec2:DeleteRouteTable
+              - ec2:ModifySubnetAttribute
+              - ec2:AssociateRouteTable
+              - ec2:DeleteVolume
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeAvailabilityZones
+              - ec2:CreateRoute
+              - ec2:CreateInternetGateway
+              - ec2:CreateSecurityGroup
+              - ec2:DescribeVolumes
+              - ec2:ModifyVpcAttribute
+              - ec2:DeleteInternetGateway
+              - ec2:DescribeRouteTables
+              - ec2:DetachVolume
+              - ec2:DetachNetworkInterface
+              - ec2:DescribeTags
+              - ec2:CreateTags
+              - ec2:DeleteRoute
+              - ec2:CreateRouteTable
+              - ec2:DetachInternetGateway
+              - ec2:DescribeSecurityGroups
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeImages
+              - ec2:DescribeSecurityGroupReferences
+              - ec2:DescribeVpcs
+              - ec2:DeleteSecurityGroup
+              - ec2:AttachNetworkInterface
+              - ec2:DeleteVpc
+              - ec2:CreateSubnet
+              - ec2:DescribeSubnets
+              - ec2:DisassociateRouteTable
+              - elasticloadbalancing:*
+              - application-autoscaling:*
+              - cloudwatch:*
+              - logs:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ecs:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - autoscaling:*
+            Resource: "*"
+        PolicyName: CloudFormationRolePolicy
+      RoleName:
+        Fn::Join:
+        - "-"
+        - - serverless
+          - Ref: AWS::StackName
+          - CloudFormation
+    Type: AWS::IAM::Role
+
+
+# Creating IAM service role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - codepipeline.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: codepipeline-service
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "logs:*"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3:*
+              Resource: !Sub 'arn:aws:s3:::${ArtifactsS3Bucket}/*'
+            - Effect: Allow
+              Action:
+                - "codebuild:*"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "ecs:*"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "cloudformation:DescribeStacks"
+                - "cloudformation:CreateStack"
+                - "cloudformation:DeleteStack"
+                - "cloudformation:UpdateStack"
+                - "cloudformation:CreateStackSet"
+                - "cloudformation:DeleteStackSet"
+                - "cloudformation:UpdateStackSet"
+                - "cloudformation:CreateStackSet"
+                - "cloudformation:DeleteStackSet"
+                - "cloudformation:CreateChangeSet"
+                - "cloudformation:DescribeChangeSet"
+                - "cloudformation:ExecuteChangeSet"
+                - "cloudformation:DeleteChangeSet"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+              - Fn::GetAtt:
+                - CloudFormationTrustRole
+                - Arn
+                  
+
+# Creating IAM service for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+        - PolicyName: ecr
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: !GetAtt ECRRepository.Arn
+                Effect: Allow
+                Action:
+                  - ecr:*
+        - PolicyName: s3artifact
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ArtifactsS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: "*"
+
